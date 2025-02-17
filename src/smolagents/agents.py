@@ -14,41 +14,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import importlib.resources
+import importlib
 import inspect
+import json
+import os
 import re
+import tempfile
 import textwrap
 import time
 from collections import deque
 from logging import getLogger
-from typing import Any, Callable, Dict, Generator, List, Optional, Set, Tuple, Union
+from pathlib import Path
+from typing import Any, Callable, Dict, Generator, List, Optional, Set, Tuple, TypedDict, Union
 
+import jinja2
 import yaml
+from huggingface_hub import create_repo, metadata_update, snapshot_download, upload_folder
 from jinja2 import StrictUndefined, Template
 from rich.console import Group
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
-from smolagents.agent_types import AgentAudio, AgentImage, handle_agent_output_types
-from smolagents.memory import ActionStep, AgentMemory, PlanningStep, SystemPromptStep, TaskStep, ToolCall
-from smolagents.monitoring import (
-    YELLOW_HEX,
-    AgentLogger,
-    LogLevel,
-)
-from smolagents.utils import (
-    AgentError,
-    AgentExecutionError,
-    AgentGenerationError,
-    AgentMaxStepsError,
-    AgentParsingError,
-    parse_code_blobs,
-    parse_json_tool_call,
-    truncate_content,
-)
-
-from .agent_types import AgentType
+from .agent_types import AgentAudio, AgentImage, AgentType, handle_agent_output_types
 from .default_tools import TOOL_MAPPING, FinalAnswerTool
 from .e2b_executor import E2BExecutor
 from .local_python_executor import (
@@ -56,12 +44,30 @@ from .local_python_executor import (
     LocalPythonInterpreter,
     fix_final_answer_code,
 )
+from .memory import ActionStep, AgentMemory, PlanningStep, SystemPromptStep, TaskStep, ToolCall
 from .models import (
     ChatMessage,
     MessageRole,
+    Model,
 )
-from .monitoring import Monitor
+from .monitoring import (
+    YELLOW_HEX,
+    AgentLogger,
+    LogLevel,
+    Monitor,
+)
 from .tools import Tool
+from .utils import (
+    AgentError,
+    AgentExecutionError,
+    AgentGenerationError,
+    AgentMaxStepsError,
+    AgentParsingError,
+    make_init_file,
+    parse_code_blobs,
+    parse_json_tool_call,
+    truncate_content,
+)
 
 
 logger = getLogger(__name__)
@@ -80,6 +86,85 @@ def populate_template(template: str, variables: Dict[str, Any]) -> str:
         raise Exception(f"Error during jinja template rendering: {type(e).__name__}: {e}")
 
 
+class PlanningPromptTemplate(TypedDict):
+    """
+    Prompt templates for the planning step.
+
+    Args:
+        initial_facts (`str`): Initial facts prompt.
+        initial_plan (`str`): Initial plan prompt.
+        update_facts_pre_messages (`str`): Update facts pre-messages prompt.
+        update_facts_post_messages (`str`): Update facts post-messages prompt.
+        update_plan_pre_messages (`str`): Update plan pre-messages prompt.
+        update_plan_post_messages (`str`): Update plan post-messages prompt.
+    """
+
+    initial_facts: str
+    initial_plan: str
+    update_facts_pre_messages: str
+    update_facts_post_messages: str
+    update_plan_pre_messages: str
+    update_plan_post_messages: str
+
+
+class ManagedAgentPromptTemplate(TypedDict):
+    """
+    Prompt templates for the managed agent.
+
+    Args:
+        task (`str`): Task prompt.
+        report (`str`): Report prompt.
+    """
+
+    task: str
+    report: str
+
+
+class FinalAnswerPromptTemplate(TypedDict):
+    """
+    Prompt templates for the final answer.
+
+    Args:
+        pre_messages (`str`): Pre-messages prompt.
+        post_messages (`str`): Post-messages prompt.
+    """
+
+    pre_messages: str
+    post_messages: str
+
+
+class PromptTemplates(TypedDict):
+    """
+    Prompt templates for the agent.
+
+    Args:
+        system_prompt (`str`): System prompt.
+        planning ([`~agents.PlanningPromptTemplate`]): Planning prompt templates.
+        managed_agent ([`~agents.ManagedAgentPromptTemplate`]): Managed agent prompt templates.
+        final_answer ([`~agents.FinalAnswerPromptTemplate`]): Final answer prompt templates.
+    """
+
+    system_prompt: str
+    planning: PlanningPromptTemplate
+    managed_agent: ManagedAgentPromptTemplate
+    final_answer: FinalAnswerPromptTemplate
+
+
+EMPTY_PROMPT_TEMPLATES = PromptTemplates(
+    system_prompt="",
+    planning=PlanningPromptTemplate(
+        initial_facts="",
+        initial_plan="",
+        update_facts_pre_messages="",
+        update_facts_post_messages="",
+        update_plan_pre_messages="",
+        update_plan_post_messages="",
+    ),
+    managed_agent=ManagedAgentPromptTemplate(task="", report=""),
+    final_answer=FinalAnswerPromptTemplate(pre_messages="", post_messages=""),
+)
+
+
 class MultiStepAgent:
     """
     Agent class that solves the given task step by step, using the ReAct framework:
@@ -88,7 +173,7 @@ class MultiStepAgent:
     Args:
         tools (`list[Tool]`): [`Tool`]s that the agent can use.
         model (`Callable[[list[dict[str, str]]], ChatMessage]`): Model that will generate the agent's actions.
-        prompt_templates (`dict`, *optional*): Prompt templates.
+        prompt_templates ([`~agents.PromptTemplates`], *optional*): Prompt templates.
         max_steps (`int`, default `6`): Maximum number of steps the agent can take to solve the task.
         tool_parser (`Callable`, *optional*): Function used to parse the tool calls from the LLM output.
         add_base_tools (`bool`, default `False`): Whether to add the base tools to the agent's tools.
@@ -107,7 +192,7 @@ class MultiStepAgent:
         self,
         tools: List[Tool],
         model: Callable[[List[Dict[str, str]]], ChatMessage],
-        prompt_templates: Optional[dict] = None,
+        prompt_templates: Optional[PromptTemplates] = None,
         max_steps: int = 6,
         tool_parser: Optional[Callable] = None,
         add_base_tools: bool = False,
@@ -157,108 +242,131 @@ class MultiStepAgent:
         provide_run_summary,
         final_answer_checks,
     ):
-        self.agent_name, self.model, self.prompt_templates = self.__class__.__name__, model, prompt_templates or {}
-        self.max_steps, self.step_number, self.tool_parser = max_steps, 0, tool_parser or parse_json_tool_call
-        self.grammar, self.planning_interval, self.state = grammar, planning_interval, {}
-        self.name, self.description = name, description
+        self.agent_name = self.__class__.__name__
+        self.model = model
+        self.prompt_templates = prompt_templates or EMPTY_PROMPT_TEMPLATES
+        self.max_steps = max_steps
+        self.step_number = 0
+        self.tool_parser = tool_parser or parse_json_tool_call
+        self.grammar = grammar
+        self.planning_interval = planning_interval
+        self.state = {}
+        self.name = name
+        self.description = description
         self.provide_run_summary = provide_run_summary
         self.final_answer_checks = final_answer_checks
 
         self._setup_managed_agents(managed_agents)
         self._setup_tools(tools, add_base_tools)
-
+        
         self.system_prompt = self.initialize_system_prompt()
-        self.input_messages, self.task = None, None
-        self.memory = AgentMemory(self.system_prompt)
+        self.memory = AgentMemory()
+        self.memory.steps.append(SystemPromptStep(self.system_prompt))
+        self.task = None
         self.logger = AgentLogger(level=verbosity_level)
-        self.monitor = Monitor(self.model, self.logger)
-        self.step_callbacks = step_callbacks if step_callbacks is not None else []
-        self.step_callbacks.append(self.monitor.update_metrics)
+        self.step_callbacks = step_callbacks or []
 
     def _setup_managed_agents(self, managed_agents):
+        """Set up managed agents with validation."""
         self.managed_agents = {}
-        if managed_agents:
-            assert all(agent.name and agent.description for agent in managed_agents), (
-                "All managed agents need both a name and a description!"
-            )
+        if managed_agents is not None:
+            for managed_agent in managed_agents:
+                assert managed_agent.name and managed_agent.description, (
+                    "All managed agents need both a name and a description!"
+                )
             self.managed_agents = {agent.name: agent for agent in managed_agents}
 
     def _setup_tools(self, tools, add_base_tools):
-        assert all(isinstance(tool, Tool) or issubclass(type(tool), Tool) for tool in tools), (
-            "All elements must be Tool or a subclass of Tool"
-        )
-        self.tools = {tool.name: tool for tool in tools}
-        if add_base_tools:
-            self.tools.update(
-                {
-                    name: cls()
-                    for name, cls in TOOL_MAPPING.items()
-                    if name != "python_interpreter" or self.__class__.__name__ == "ToolCallingAgent"
-                }
+        """Set up tools with validation and base tools."""
+        tool_and_managed_agent_names = [tool.name for tool in tools]
+        if self.managed_agents:
+            tool_and_managed_agent_names += [agent.name for agent in self.managed_agents.values()]
+        
+        if len(tool_and_managed_agent_names) != len(set(tool_and_managed_agent_names)):
+            raise ValueError(
+                "Each tool or managed_agent should have a unique name! You passed these duplicate names: "
+                f"{[name for name in tool_and_managed_agent_names if tool_and_managed_agent_names.count(name) > 1]}"
             )
+
+        for tool in tools:
+            assert isinstance(tool, Tool), f"This element is not of class Tool: {str(tool)}"
+        self.tools = {tool.name: tool for tool in tools}
+
+        if add_base_tools:
+            for tool_name, tool_class in TOOL_MAPPING.items():
+                if tool_name != "python_interpreter" or self.__class__.__name__ == "ToolCallingAgent":
+                    self.tools[tool_name] = tool_class()
         self.tools["final_answer"] = FinalAnswerTool()
 
     def _run(self, task: str, images: List[str] | None = None) -> Generator[ActionStep | AgentType, None, None]:
-        final_answer, self.step_number = None, 1
+        """
+        Run the agent in streaming mode and returns a generator of all the steps.
+
+        Args:
+            task (`str`): Task to perform.
+            images (`list[str]`): Paths to image(s).
+        """
+        final_answer = None
+        self.step_number = 1
         while final_answer is None and self.step_number <= self.max_steps:
             step_start_time = time.time()
-            memory_step = self._create_memory_step(step_start_time, images)
+            memory_step = ActionStep(
+                step_number=self.step_number,
+                start_time=step_start_time,
+                observations_images=images,
+            )
             try:
-                final_answer = self._execute_step(task, memory_step)
+                if self.planning_interval is not None and self.step_number % self.planning_interval == 1:
+                    self.planning_step(
+                        task,
+                        is_first_step=(self.step_number == 1),
+                        step=self.step_number,
+                    )
+                self.logger.log_rule(f"Step {self.step_number}", level=LogLevel.INFO)
+
+                # Run one step!
+                final_answer = self.step(memory_step)
+                if final_answer is not None and self.final_answer_checks is not None:
+                    for check_function in self.final_answer_checks:
+                        try:
+                            assert check_function(final_answer, self.memory)
+                        except Exception as e:
+                            final_answer = None
+                            raise AgentError(f"Check {check_function.__name__} failed with error: {e}", self.logger)
             except AgentError as e:
                 memory_step.error = e
             finally:
-                self._finalize_step(memory_step, step_start_time)
-                yield memory_step
+                memory_step.end_time = time.time()
+                memory_step.duration = memory_step.end_time - step_start_time
+                self.memory.steps.append(memory_step)
+                for callback in self.step_callbacks:
+                    # For compatibility with old callbacks that don't take the agent as an argument
+                    if len(inspect.signature(callback).parameters) == 1:
+                        callback(memory_step)
+                    else:
+                        callback(memory_step, agent=self)
                 self.step_number += 1
+                yield memory_step
 
         if final_answer is None and self.step_number == self.max_steps + 1:
-            final_answer = self._handle_max_steps_reached(task, images, step_start_time)
-            yield memory_step
+            error_message = "Reached max steps."
+            final_answer = self.provide_final_answer(task, images)
+            final_memory_step = ActionStep(
+                step_number=self.step_number, error=AgentMaxStepsError(error_message, self.logger)
+            )
+            final_memory_step.action_output = final_answer
+            final_memory_step.end_time = time.time()
+            final_memory_step.duration = memory_step.end_time - step_start_time
+            self.memory.steps.append(final_memory_step)
+            for callback in self.step_callbacks:
+                # For compatibility with old callbacks that don't take the agent as an argument
+                if len(inspect.signature(callback).parameters) == 1:
+                    callback(final_memory_step)
+                else:
+                    callback(final_memory_step, agent=self)
+            yield final_memory_step
+
         yield handle_agent_output_types(final_answer)
-
-    def _create_memory_step(self, step_start_time: float, images: List[str] | None) -> ActionStep:
-        return ActionStep(step_number=self.step_number, start_time=step_start_time, observations_images=images)
-
-    def _execute_step(self, task: str, memory_step: ActionStep) -> Union[None, Any]:
-        if self.planning_interval is not None and self.step_number % self.planning_interval == 1:
-            self.planning_step(task, is_first_step=(self.step_number == 1), step=self.step_number)
-        self.logger.log_rule(f"Step {self.step_number}", level=LogLevel.INFO)
-        final_answer = self.step(memory_step)
-        if final_answer is not None and self.final_answer_checks:
-            self._validate_final_answer(final_answer)
-        return final_answer
-
-    def _validate_final_answer(self, final_answer: Any):
-        for check_function in self.final_answer_checks:
-            try:
-                assert check_function(final_answer, self.memory)
-            except Exception as e:
-                raise AgentError(f"Check {check_function.__name__} failed with error: {e}", self.logger)
-
-    def _finalize_step(self, memory_step: ActionStep, step_start_time: float):
-        memory_step.end_time = time.time()
-        memory_step.duration = memory_step.end_time - step_start_time
-        self.memory.steps.append(memory_step)
-        for callback in self.step_callbacks:
-            callback(memory_step) if len(inspect.signature(callback).parameters) == 1 else callback(
-                memory_step, agent=self
-            )
-
-    def _handle_max_steps_reached(self, task: str, images: List[str], step_start_time: float) -> Any:
-        final_answer = self.provide_final_answer(task, images)
-        final_memory_step = ActionStep(
-            step_number=self.step_number, error=AgentMaxStepsError("Reached max steps.", self.logger)
-        )
-        final_memory_step.action_output = final_answer
-        final_memory_step.end_time = time.time()
-        final_memory_step.duration = final_memory_step.end_time - step_start_time
-        self.memory.steps.append(final_memory_step)
-        for callback in self.step_callbacks:
-            callback(final_memory_step) if len(inspect.signature(callback).parameters) == 1 else callback(
-                final_memory_step, agent=self
-            )
-        return final_answer
 
     def planning_step(self, task, is_first_step: bool, step: int) -> None:
         facts_message, plan_message = (
@@ -423,46 +531,33 @@ class MultiStepAgent:
         Returns:
             `str`: Final answer to the task.
         """
-        messages = [{"role": MessageRole.SYSTEM, "content": []}]
+        messages = [
+            {
+                "role": MessageRole.SYSTEM,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": self.prompt_templates["final_answer"]["pre_messages"],
+                    }
+                ],
+            }
+        ]
         if images:
-            messages[0]["content"] = [
-                {
-                    "type": "text",
-                    "text": "An agent tried to answer a user query but it got stuck and failed to do so. You are tasked with providing an answer instead. Here is the agent's memory:",
-                }
-            ]
             messages[0]["content"].append({"type": "image"})
-            messages += self.write_memory_to_messages()[1:]
-            messages += [
-                {
-                    "role": MessageRole.USER,
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"Based on the above, please provide an answer to the following user request:\n{task}",
-                        }
-                    ],
-                }
-            ]
-        else:
-            messages[0]["content"] = [
-                {
-                    "type": "text",
-                    "text": "An agent tried to answer a user query but it got stuck and failed to do so. You are tasked with providing an answer instead. Here is the agent's memory:",
-                }
-            ]
-            messages += self.write_memory_to_messages()[1:]
-            messages += [
-                {
-                    "role": MessageRole.USER,
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"Based on the above, please provide an answer to the following user request:\n{task}",
-                        }
-                    ],
-                }
-            ]
+        messages += self.write_memory_to_messages()[1:]
+        messages += [
+            {
+                "role": MessageRole.USER,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": populate_template(
+                            self.prompt_templates["final_answer"]["post_messages"], variables={"task": task}
+                        ),
+                    }
+                ],
+            }
+        ]
         try:
             chat_message: ChatMessage = self.model(messages)
             return chat_message.content
@@ -582,7 +677,7 @@ class ToolCallingAgent(MultiStepAgent):
     Args:
         tools (`list[Tool]`): [`Tool`]s that the agent can use.
         model (`Callable[[list[dict[str, str]]], ChatMessage]`): Model that will generate the agent's actions.
-        prompt_templates (`dict`, *optional*): Prompt templates.
+        prompt_templates ([`~agents.PromptTemplates`], *optional*): Prompt templates.
         planning_interval (`int`, *optional*): Interval at which the agent will run a planning step.
         **kwargs: Additional keyword arguments.
     """
@@ -591,7 +686,7 @@ class ToolCallingAgent(MultiStepAgent):
         self,
         tools: List[Tool],
         model: Callable[[List[Dict[str, str]]], ChatMessage],
-        prompt_templates: Optional[dict] = None,
+        prompt_templates: Optional[PromptTemplates] = None,
         planning_interval: Optional[int] = None,
         **kwargs,
     ):
@@ -704,7 +799,7 @@ class CodeAgent(MultiStepAgent):
     Args:
         tools (`list[Tool]`): [`Tool`]s that the agent can use.
         model (`Callable[[list[dict[str, str]]], ChatMessage]`): Model that will generate the agent's actions.
-        prompt_templates (`dict`, *optional*): Prompt templates.
+        prompt_templates ([`~agents.PromptTemplates`], *optional*): Prompt templates.
         grammar (`dict[str, str]`, *optional*): Grammar used to parse the LLM output.
         additional_authorized_imports (`list[str]`, *optional*): Additional authorized imports for the agent.
         planning_interval (`int`, *optional*): Interval at which the agent will run a planning step.
@@ -718,7 +813,7 @@ class CodeAgent(MultiStepAgent):
         self,
         tools: List[Tool],
         model: Callable[[List[Dict[str, str]]], ChatMessage],
-        prompt_templates: Optional[dict] = None,
+        prompt_templates: Optional[PromptTemplates] = None,
         grammar: Optional[Dict[str, str]] = None,
         additional_authorized_imports: Optional[List[str]] = None,
         planning_interval: Optional[int] = None,
@@ -728,6 +823,8 @@ class CodeAgent(MultiStepAgent):
     ):
         self.additional_authorized_imports = additional_authorized_imports if additional_authorized_imports else []
         self.authorized_imports = list(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
+        self.use_e2b_executor = use_e2b_executor
+        self.max_print_outputs_length = max_print_outputs_length
         prompt_templates = prompt_templates or yaml.safe_load(
             importlib.resources.files("smolagents.prompts").joinpath("code_agent.yaml").read_text()
         )
@@ -870,6 +967,3 @@ class CodeAgent(MultiStepAgent):
         self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
         memory_step.action_output = output
         return output if is_final_answer else None
-
-
-__all__ = ["MultiStepAgent", "CodeAgent", "ToolCallingAgent", "AgentMemory"]
