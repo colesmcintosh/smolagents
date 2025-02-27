@@ -55,6 +55,19 @@ First install the package.
 ```bash
 pip install smolagents
 ```
+
+For additional features, you can install optional dependencies:
+```bash
+# For Docker-based code execution
+pip install "smolagents[docker]"
+
+# For E2B-based code execution
+pip install "smolagents[e2b]"
+
+# For all features
+pip install "smolagents[all]"
+```
+
 Then define your agent, give it the tools it needs and run it!
 ```py
 from smolagents import CodeAgent, DuckDuckGoSearchTool, HfApiModel
