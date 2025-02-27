@@ -1,4 +1,4 @@
-.PHONY: quality style test docs utils
+.PHONY: quality style test docs utils clean
 
 check_dirs := examples src tests utils
 
@@ -17,3 +17,8 @@ style:
 test:
 	pip install -e ".[docker]"
 	pytest ./tests/
+	$(MAKE) clean
+
+# Clean up test artifacts
+clean:
+	rm -rf agent_export/
