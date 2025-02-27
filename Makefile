@@ -15,4 +15,5 @@ style:
 	
 # Run smolagents tests
 test:
+	pip install -e ".[docker]"
 	pytest ./tests/
