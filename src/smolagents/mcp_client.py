@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import warnings
 from types import TracebackType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from smolagents.tools import Tool
 
@@ -87,6 +87,7 @@ class MCPClient:
         server_parameters: "StdioServerParameters" | dict[str, Any] | list["StdioServerParameters" | dict[str, Any]],
         adapter_kwargs: dict[str, Any] | None = None,
         structured_output: bool | None = None,
+        elicitation_handler: Callable[..., Any] | None = None,
     ):
         # Handle future warning for structured_output default value change
         if structured_output is None:
@@ -115,6 +116,19 @@ class MCPClient:
                     f"Unsupported transport: {transport}. Supported transports are 'streamable-http' and 'sse'."
                 )
         adapter_kwargs = adapter_kwargs or {}
+
+        # If an explicit elicitation_handler is provided, forward it to MCPAdapt.
+        # If both adapter_kwargs and explicit param provide a handler, the explicit
+        # param wins and we warn to make the precedence clear.
+        if elicitation_handler is not None:
+            if "elicitation_handler" in adapter_kwargs and adapter_kwargs["elicitation_handler"] is not elicitation_handler:
+                warnings.warn(
+                    "Both 'adapter_kwargs[\"elicitation_handler\"]' and 'elicitation_handler' were provided. "
+                    "Using the explicit 'elicitation_handler' parameter and ignoring the value in 'adapter_kwargs'.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            adapter_kwargs["elicitation_handler"] = elicitation_handler
         self._adapter = MCPAdapt(
             server_parameters, SmolAgentsAdapter(structured_output=structured_output), **adapter_kwargs
         )

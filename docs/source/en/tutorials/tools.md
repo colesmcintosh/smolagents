@@ -249,6 +249,32 @@ When structured output is enabled, the `CodeAgent` system prompt is enhanced to 
 
 **Future Change**: In a future release, the default value of `structured_output` will change from `False` to `True`. It is recommended to explicitly set `structured_output=True` to opt into the enhanced functionality, which provides better tool output handling and improved agent performance. Use `structured_output=False` only if you specifically need to maintain the current text-only behavior.
 
+#### User Elicitation (MCP Client-Side Prompts)
+
+`MCPClient` supports client-side user elicitation callbacks, allowing an MCP server to pause execution and ask the user for input (per the MCP client elicitation spec). You can supply an `elicitation_handler` when creating `MCPClient`, or pass it via `adapter_kwargs`.
+
+Basic example with a synchronous prompt:
+
+```python
+from smolagents import MCPClient, CodeAgent
+from mcp import StdioServerParameters
+
+def ask_user(request):
+    # `request` contains the server's elicitation details (e.g., prompt, fields)
+    # Return a value (or structured dict) matching the server's expectations.
+    prompt = request.get("prompt") or "Please provide input: "
+    value = input(f"[Elicitation] {prompt} ")
+    return {"value": value}
+
+server_parameters = StdioServerParameters(command="python", args=["demo/server.py"])
+
+with MCPClient(server_parameters, elicitation_handler=ask_user) as tools:
+    agent = CodeAgent(tools=tools, model=model)
+    agent.run("Do the thing that might require asking me a question")
+```
+
+You can also provide an async handler if your environment supports it. If both `adapter_kwargs["elicitation_handler"]` and the explicit `elicitation_handler` parameter are given, the explicit parameter takes precedence.
+
 ### Import a Space as a tool
 
 You can directly import a Gradio Space from the Hub as a tool using the [`Tool.from_space`] method!
@@ -409,4 +435,3 @@ agent.run("Please draw me a picture of rivers and lakes.")
 ```
 
 To speed up the start, tools are loaded only if called by the agent.
-
